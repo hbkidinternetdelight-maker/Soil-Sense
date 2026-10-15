@@ -1,35 +1,51 @@
+
 import os
 import sqlite3
 from datetime import datetime
+
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from crop_data import CROP_DATA
 from irrigation import get_irrigation_recommendation
 
+
+# ================= SOILSENSE CONFIG =================
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.environ.get("SOILSENSE_DB_PATH", os.path.join(BASE_DIR, "soilsense.db"))
+DB_PATH = os.environ.get(
+    "SOILSENSE_DB_PATH",
+    os.path.join(BASE_DIR, "soilsense.db")
+)
 
 app = Flask(__name__)
 
-FRONTEND_URL = os.environ.get(
-    "FRONTEND_URL",
-    "https://soilsense-frontend-pe0n.onrender.com"
-).rstrip("/")
-
-# Allow the currently deployed frontend and the legacy frontend URL.
-# This prevents browser CORS blocks for API requests from the live website.
-ALLOWED_ORIGINS = list({
-    FRONTEND_URL,
+# Allow the current frontend and the older frontend URL.
+FRONTEND_URLS = [
     "https://soilsense-frontend-pe0n.onrender.com",
     "https://soil-sense-frontend.onrender.com",
-})
+]
+
+# Include any additional frontend origin configured on Render.
+env_frontend_url = os.environ.get("FRONTEND_URL", "").rstrip("/")
+if env_frontend_url and env_frontend_url not in FRONTEND_URLS:
+    FRONTEND_URLS.append(env_frontend_url)
+
+# CORS must be configured before serving API requests.
 CORS(
     app,
-    resources={r"/api/*": {"origins": ALLOWED_ORIGINS}},
-    supports_credentials=True,
+    resources={
+        r"/api/*": {
+            "origins": FRONTEND_URLS,
+            "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"],
+        }
+    },
 )
 
+
+# ================= DATABASE =================
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -67,6 +83,8 @@ def init_db():
 init_db()
 
 
+# ================= HOME =================
+
 @app.get("/")
 def home():
     return jsonify({
@@ -75,15 +93,20 @@ def home():
     })
 
 
+# ================= SENSOR =================
+
 @app.get("/api/sensor")
 def get_sensor():
     conn = get_db()
+
     row = conn.execute("""
-        SELECT id, moisture, temperature, humidity, sensor_id, timestamp
+        SELECT id, moisture, temperature, humidity,
+               sensor_id, timestamp
         FROM sensor_readings
         ORDER BY id DESC
         LIMIT 1
     """).fetchone()
+
     conn.close()
 
     if not row:
@@ -105,30 +128,53 @@ def save_sensor():
     try:
         moisture = float(data["moisture"])
     except (KeyError, TypeError, ValueError):
-        return jsonify({"success": False, "message": "Valid moisture is required"}), 400
+        return jsonify({
+            "success": False,
+            "message": "Valid moisture is required"
+        }), 400
+
+    if not 0 <= moisture <= 100:
+        return jsonify({
+            "success": False,
+            "message": "Moisture must be between 0 and 100"
+        }), 400
 
     temperature = data.get("temperature")
     humidity = data.get("humidity")
     sensor_id = data.get("sensor_id", "ESP32_SOILSENSE")
 
     try:
-        temperature = float(temperature) if temperature is not None else None
+        temperature = (
+            float(temperature)
+            if temperature is not None else None
+        )
     except (TypeError, ValueError):
         temperature = None
 
     try:
-        humidity = float(humidity) if humidity is not None else None
+        humidity = (
+            float(humidity)
+            if humidity is not None else None
+        )
     except (TypeError, ValueError):
         humidity = None
 
     timestamp = datetime.utcnow().isoformat()
 
     conn = get_db()
+
     conn.execute("""
         INSERT INTO sensor_readings
         (moisture, temperature, humidity, sensor_id, timestamp)
         VALUES (?, ?, ?, ?, ?)
-    """, (moisture, temperature, humidity, sensor_id, timestamp))
+    """, (
+        moisture,
+        temperature,
+        humidity,
+        sensor_id,
+        timestamp
+    ))
+
     conn.commit()
     conn.close()
 
@@ -148,34 +194,46 @@ def save_sensor():
 @app.get("/api/sensor/history")
 def sensor_history():
     conn = get_db()
+
     rows = conn.execute("""
-        SELECT id, moisture, temperature, humidity, sensor_id, timestamp
+        SELECT id, moisture, temperature, humidity,
+               sensor_id, timestamp
         FROM sensor_readings
         ORDER BY id DESC
         LIMIT 100
     """).fetchall()
+
     conn.close()
 
     return jsonify([dict(row) for row in rows])
 
 
+# ================= WEATHER =================
+
 @app.get("/api/weather")
 def weather():
-    import requests
-
     location = request.args.get("location", "Pune").strip()
 
     try:
         geo = requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": location, "count": 1, "language": "en", "format": "json"},
+            params={
+                "name": location,
+                "count": 1,
+                "language": "en",
+                "format": "json"
+            },
             timeout=10
         )
         geo.raise_for_status()
+
         results = geo.json().get("results", [])
 
         if not results:
-            return jsonify({"success": False, "message": "Location not found"}), 404
+            return jsonify({
+                "success": False,
+                "message": "Location not found"
+            }), 404
 
         place = results[0]
         lat = place["latitude"]
@@ -186,19 +244,26 @@ def weather():
             params={
                 "latitude": lat,
                 "longitude": lon,
-                "current": "temperature_2m,relative_humidity_2m,rain,precipitation,wind_speed_10m",
-                "hourly": "precipitation_probability,rain,precipitation",
+                "current": (
+                    "temperature_2m,relative_humidity_2m,"
+                    "rain,precipitation,wind_speed_10m"
+                ),
+                "hourly": (
+                    "precipitation_probability,rain,precipitation"
+                ),
                 "forecast_days": 2,
                 "timezone": "auto"
             },
             timeout=10
         )
         forecast.raise_for_status()
-        data = forecast.json()
 
+        data = forecast.json()
         current = data.get("current", {})
         hourly = data.get("hourly", {})
-        rain_probabilities = hourly.get("precipitation_probability", [])
+        rain_probabilities = hourly.get(
+            "precipitation_probability", []
+        )
 
         return jsonify({
             "success": True,
@@ -208,22 +273,33 @@ def weather():
             "temperature": current.get("temperature_2m"),
             "humidity": current.get("relative_humidity_2m"),
             "rainfall": current.get("precipitation"),
-            "rain_probability": rain_probabilities[0] if rain_probabilities else 0,
+            "rain_probability": (
+                rain_probabilities[0]
+                if rain_probabilities else 0
+            ),
             "wind": current.get("wind_speed_10m")
         })
 
-    except requests.RequestException as e:
-        return jsonify({"success": False, "message": str(e)}), 502
+    except requests.RequestException as error:
+        app.logger.exception("Weather API request failed")
+        return jsonify({
+            "success": False,
+            "message": "Weather service temporarily unavailable"
+        }), 502
 
+
+# ================= FIELD AREAS =================
 
 @app.get("/api/areas")
 def get_areas():
     conn = get_db()
+
     rows = conn.execute("""
         SELECT id, area, moisture, timestamp
         FROM area_readings
         ORDER BY id ASC
     """).fetchall()
+
     conn.close()
 
     return jsonify([dict(row) for row in rows])
@@ -235,7 +311,10 @@ def save_areas():
     areas = data.get("areas", [])
 
     if not isinstance(areas, list):
-        return jsonify({"success": False, "message": "areas must be a list"}), 400
+        return jsonify({
+            "success": False,
+            "message": "areas must be a list"
+        }), 400
 
     conn = get_db()
 
@@ -244,6 +323,7 @@ def save_areas():
             continue
 
         area = str(item.get("area", "")).strip()
+
         if not area:
             continue
 
@@ -252,7 +332,13 @@ def save_areas():
         except (TypeError, ValueError):
             continue
 
-        timestamp = item.get("timestamp") or datetime.utcnow().isoformat()
+        if not 0 <= moisture <= 100:
+            continue
+
+        timestamp = (
+            item.get("timestamp")
+            or datetime.utcnow().isoformat()
+        )
 
         conn.execute("""
             INSERT INTO area_readings (area, moisture, timestamp)
@@ -262,8 +348,13 @@ def save_areas():
     conn.commit()
     conn.close()
 
-    return jsonify({"success": True, "message": "Areas saved"})
+    return jsonify({
+        "success": True,
+        "message": "Areas saved"
+    })
 
+
+# ================= CROP RECOMMENDATION =================
 
 @app.post("/api/recommendation")
 def recommendation():
@@ -281,19 +372,18 @@ def recommendation():
     try:
         moisture = float(data.get("moisture"))
     except (TypeError, ValueError):
-        return jsonify({"success": False, "message": "Valid moisture is required"}), 400
-
-    temperature = data.get("temperature")
-    humidity = data.get("humidity")
-    rain_probability = data.get("rain_probability", 0)
+        return jsonify({
+            "success": False,
+            "message": "Valid moisture is required"
+        }), 400
 
     result = get_irrigation_recommendation(
         crop=crop,
         stage=stage,
         moisture=moisture,
-        temperature=temperature,
-        humidity=humidity,
-        rain_probability=rain_probability
+        temperature=data.get("temperature"),
+        humidity=data.get("humidity"),
+        rain_probability=data.get("rain_probability", 0)
     )
 
     return jsonify({
@@ -311,12 +401,18 @@ def advisor():
     stage = str(data.get("stage", "")).lower().strip()
 
     if crop not in CROP_DATA:
-        return jsonify({"success": False, "message": "Crop not supported"}), 400
+        return jsonify({
+            "success": False,
+            "message": "Crop not supported"
+        }), 400
 
     try:
         moisture = float(data.get("moisture"))
     except (TypeError, ValueError):
-        return jsonify({"success": False, "message": "Valid moisture is required"}), 400
+        return jsonify({
+            "success": False,
+            "message": "Valid moisture is required"
+        }), 400
 
     result = get_irrigation_recommendation(
         crop=crop,
@@ -335,5 +431,11 @@ def advisor():
     })
 
 
+# ================= START SERVER =================
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        debug=False
+    )
